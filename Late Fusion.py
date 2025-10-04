@@ -19,7 +19,7 @@ import joblib
 # ==================================================
 def generate_pseudo_images_per_sample():
     # 读取Excel数据
-    df = pd.read_excel('D:/谱/BeefClassifier/data/zq_spectra_data.xlsx')
+    df = pd.read_excel('zq_spectra_data.xlsx')
 
     # 确保目录存在
     os.makedirs('pseudo_images/zq', exist_ok=True)
@@ -206,7 +206,7 @@ if __name__ == '__main__':
     concentrations = set()
 
     # 扫描RGB图像目录
-    image_base_dir = 'D:/谱/BeefClassifier/data/zq_beef_images_resized'
+    image_base_dir = 'zq_beef_images_resized'
     for conc_dir in os.listdir(image_base_dir):
         conc_path = os.path.join(image_base_dir, conc_dir)
         if os.path.isdir(conc_path):
@@ -433,4 +433,5 @@ if __name__ == '__main__':
         'rgb_feature_size': rgb_feature_size,
         'num_classes': num_classes
     }, 'models/zq/full_late_fusion_model.pth')
+
     print("完整模型已保存到 models/zq/full_late_fusion_model.pth")
