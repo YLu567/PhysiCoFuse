@@ -24,7 +24,7 @@ import time  # 添加时间模块
 # ==================================================
 def generate_pseudo_images_per_sample():
     # 读取Excel数据
-    df = pd.read_excel('D:/开题/电谱/BeefClassifier/data/卡拉胶复合胶增强.xlsx')
+    df = pd.read_excel('卡拉胶复合胶增强.xlsx')
 
     # 确保目录存在
     os.makedirs('pseudo_images/carrageenan_vs_composite', exist_ok=True)
@@ -407,7 +407,7 @@ if __name__ == '__main__':
     rgb_image_map = {}
 
     # 扫描RGB图像目录
-    image_base_dir = 'D:/开题/电谱/BeefClassifier/data/detect_data - zq'
+    image_base_dir = 'detect_data - zq'
     type_folders = ['Carrageenan', 'Composite hydrocolloid']
 
     for type_idx, type_folder in enumerate(type_folders):
@@ -978,4 +978,5 @@ if __name__ == '__main__':
             'baseline_accuracy': results[0.0]['accuracy']
         }
     }, 'models/carrageenan_vs_composite/full_model.pth')
+
     print("\n完整模型已保存到 models/carrageenan_vs_composite/full_model.pth")
