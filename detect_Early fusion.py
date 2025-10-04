@@ -22,7 +22,7 @@ import time  # 添加时间模块
 # ==================================================
 def generate_pseudo_images_per_sample():
     # 读取Excel数据
-    df = pd.read_excel('D:/开题/电谱/BeefClassifier/data/卡拉胶复合胶增强.xlsx')
+    df = pd.read_excel('卡拉胶复合胶增强.xlsx')
 
     # 确保目录存在
     os.makedirs('pseudo_images/classification', exist_ok=True)
@@ -323,7 +323,7 @@ if __name__ == '__main__':
     class_names = ["Carrageenan", "Composite"]
 
     # 扫描RGB图像目录
-    image_base_dir = 'D:/开题/电谱/BeefClassifier/data/detect_data - zq'
+    image_base_dir = 'detect_data - zq'
     for class_dir in os.listdir(image_base_dir):
         class_path = os.path.join(image_base_dir, class_dir)
         if os.path.isdir(class_path):
@@ -712,4 +712,5 @@ if __name__ == '__main__':
     print("\n训练和噪声测试完成！")
     print(f"最佳验证准确率: {best_val_acc:.2f}%")
     print(f"测试集基准准确率: {baseline_acc:.2f}%")
+
     print(f"总程序运行时间: {total_time:.2f} 秒 ({total_time / 60:.2f} 分钟)")
