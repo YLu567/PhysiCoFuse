@@ -23,7 +23,7 @@ import datetime
 # ==================================================
 def generate_pseudo_images_per_sample():
     # 读取Excel数据
-    df = pd.read_excel('D:/开题/电谱/BeefClassifier/data/卡拉胶复合胶增强.xlsx')
+    df = pd.read_excel('卡拉胶复合胶增强.xlsx')
 
     # 确保目录存在
     os.makedirs('pseudo_images/carrageenan_composite', exist_ok=True)
@@ -468,7 +468,7 @@ if __name__ == '__main__':
     rgb_image_map = {}
 
     # 扫描RGB图像目录（detect data文件夹）
-    image_base_dir = 'D:/开题/电谱/BeefClassifier/data/detect_data - zq'
+    image_base_dir = 'detect_data - zq'
     type_folders = ['Carrageenan', 'Composite hydrocolloid']
     type_mapping = {'Carrageenan': 0, 'Composite hydrocolloid': 1}  # 卡拉胶=0, 复合胶=1
 
@@ -824,5 +824,6 @@ if __name__ == '__main__':
         f.write("0: Carrageenan\n")
         f.write("1: Composite hydrocolloid\n")
     print("类型映射信息已保存到 datasets/carrageenan_composite/type_mapping.txt")
+
 
     print("\n训练和扩展噪声测试完成！")
