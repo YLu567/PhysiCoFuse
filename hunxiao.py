@@ -23,7 +23,7 @@ import seaborn as sns
 # ==================================================
 def generate_pseudo_images_per_sample():
     # 读取Excel数据
-    df = pd.read_excel('D:\\开题\\电谱\\BeefClassifier\\data\\zq_spectra_data.xlsx')
+    df = pd.read_excel('zq_spectra_data.xlsx')
 
     # 确保目录存在
     os.makedirs('pseudo_images/zq-full-h', exist_ok=True)
@@ -342,7 +342,7 @@ if __name__ == '__main__':
     concentrations = set()
 
     # 扫描RGB图像目录
-    image_base_dir = 'D:\\开题\\电谱\\BeefClassifier\\data\\zq_beef_images_resized'
+    image_base_dir = 'zq_beef_images_resized'
     for conc_dir in os.listdir(image_base_dir):
         conc_path = os.path.join(image_base_dir, conc_dir)
         if os.path.isdir(conc_path):
@@ -773,4 +773,5 @@ if __name__ == '__main__':
         'spectral_scaler': spectral_scaler,
         'val_acc': final_acc
     }, 'models/zq-full-h/full_model.pth')
+
     print("完整模型已保存到 models/zq-full-h/full_model.pth")
