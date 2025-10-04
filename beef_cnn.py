@@ -84,7 +84,7 @@ def create_1d_cnn_model(input_shape, num_classes):
 # =====================
 if __name__ == "__main__":
     # 参数设置
-    DATA_PATH = 'D:/谱/BeefClassifier/data/zq_spectra_data.xlsx'
+    DATA_PATH = 'zq_spectra_data.xlsx'
     TEST_SIZE = 0.3  # 增大测试集比例
     RANDOM_STATE = 42
     EPOCHS = 50  # 减少训练轮次
@@ -124,4 +124,5 @@ if __name__ == "__main__":
     # 额外评估训练集以显示过拟合程度
     train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
     print(f"训练准确率: {train_acc:.4f}")
+
     print(f"过拟合程度: {train_acc - test_acc:.4f}")
