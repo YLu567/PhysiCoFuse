@@ -1,0 +1,765 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib
+
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.model_selection import StratifiedKFold
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.models import resnet50, ResNet50_Weights
+import joblib
+import copy
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+import re  # Import regex module for parsing labels
+import io  # Import io module for calculating model size
+import time  # Import time module for measuring inference time
+
+
+# ==================================================
+# 1. 特征提取器 (ResNet50)
+# ==================================================
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        # 移除最后的全连接层
+        self.resnet = nn.Sequential(*list(self.resnet.children())[:-1])
+
+    def forward(self, x):
+        return self.resnet(x).squeeze()
+
+
+# ==================================================
+# 2. 数据集类 (用于特征向量)
+# ==================================================
+class FeatureDataset(Dataset):
+    def __init__(self, features, labels):
+        self.features = features
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+
+# ==================================================
+# 3. 分类器模型
+# ==================================================
+class FeatureClassifier(nn.Module):
+    def __init__(self, input_size, num_classes):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(input_size, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        )
+
+    def forward(self, x):
+        return self.classifier(x)
+
+
+# ==================================================
+# 4. 训练和验证函数
+# ==================================================
+def train_epoch(model, train_loader, criterion, optimizer, device):
+    """训练一个epoch"""
+    model.train()
+    train_loss = 0.0
+    correct = 0
+    total = 0
+
+    for features, labels in train_loader:
+        features = features.to(device)
+        labels = labels.to(device)
+
+        # --- Debug Print ---
+        # print(f"DEBUG: Labels in train batch: min={labels.min()}, max={labels.max()}")
+        # if labels.max() >= model.classifier[-1].out_features:
+        #     print(f"ERROR in train: Label {labels.max()} is >= num_classes {model.classifier[-1].out_features}")
+        #     break
+        # -------------------
+
+        optimizer.zero_grad()
+        outputs = model(features)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    train_acc = 100. * correct / total
+    train_loss = train_loss / len(train_loader)
+
+    return train_loss, train_acc
+
+
+def validate(model, val_loader, criterion, device):
+    """验证模型"""
+    model.eval()
+    val_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+
+    # --- 推理时间测量 ---
+    inference_times = []
+    # -------------------------------
+
+    with torch.no_grad():
+        for features, labels in val_loader:
+            features = features.to(device)
+            labels = labels.to(device)
+
+            # --- Debug Print ---
+            # print(f"DEBUG: Labels in val batch: min={labels.min()}, max={labels.max()}")
+            # if labels.max() >= model.classifier[-1].out_features:
+            #     print(f"ERROR in val: Label {labels.max()} is >= num_classes {model.classifier[-1].out_features}")
+            #     break
+            # -------------------
+
+            # --- 测量单个批次的推理时间 ---
+            start_time = time.time()
+            outputs = model(features)
+            # 确保GPU操作完成后再测量结束时间
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            end_time = time.time()
+
+            batch_inference_time = (end_time - start_time) / features.size(0)  # 平均每个样本的时间
+            inference_times.append(batch_inference_time)
+            # ----------------------------------------------
+
+            loss = criterion(outputs, labels)
+
+            val_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    val_acc = 100. * correct / total
+    val_loss = val_loss / len(val_loader)
+
+    # --- 计算所有批次的平均推理时间 ---
+    avg_inference_time = np.mean(inference_times) if inference_times else 0.0
+    # ---------------------------------------------------------
+
+    return val_loss, val_acc, all_preds, all_labels, avg_inference_time
+
+
+# ==================================================
+# 5. 绘图函数
+# ==================================================
+def plot_loss_curves(train_losses, val_losses, train_accuracies, val_accuracies, fold, save_dir='models/zq_cv'):
+    """绘制训练和验证损失/准确率曲线"""
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'fold_{fold + 1}_training_curves.png')
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+    # 绘制损失曲线
+    epochs = range(1, len(train_losses) + 1)
+    ax1.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+    ax1.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+    ax1.set_title(f'Fold {fold + 1} - Training & Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 绘制准确率曲线
+    ax2.plot(epochs, train_accuracies, 'b-', label='Training Accuracy', linewidth=2)
+    ax2.plot(epochs, val_accuracies, 'r-', label='Validation Accuracy', linewidth=2)
+    ax2.set_title(f'Fold {fold + 1} - Training & Validation Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Training curves for Fold {fold + 1} saved to: {save_path}")
+
+
+def plot_cross_validation_results(fold_accuracies, fold_losses, fold_inference_times, save_dir='models/zq_cv'):
+    """绘制交叉验证结果"""
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, 'cross_validation_results.png')
+
+    plt.figure(figsize=(20, 5))
+
+    # 准确率柱状图
+    plt.subplot(1, 4, 1)
+    folds = range(1, 6)
+    bars = plt.bar(folds, fold_accuracies, alpha=0.8)
+    plt.axhline(y=np.mean(fold_accuracies), color='r', linestyle='--',
+                linewidth=2, label=f'Mean: {np.mean(fold_accuracies):.2f}%')
+    plt.title('Validation Accuracy per Fold', fontsize=14)
+    plt.xlabel('Fold', fontsize=12)
+    plt.ylabel('Validation Accuracy (%)', fontsize=12)
+    plt.xticks(folds)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+
+    for bar, acc in zip(bars, fold_accuracies):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                 f'{acc:.2f}%', ha='center', va='bottom', fontsize=10)
+
+    # 损失柱状图
+    plt.subplot(1, 4, 2)
+    bars = plt.bar(folds, fold_losses, alpha=0.8, color='orange')
+    plt.axhline(y=np.mean(fold_losses), color='r', linestyle='--',
+                linewidth=2, label=f'Mean: {np.mean(fold_losses):.4f}')
+    plt.title('Validation Loss per Fold', fontsize=14)
+    plt.xlabel('Fold', fontsize=12)
+    plt.ylabel('Validation Loss', fontsize=12)
+    plt.xticks(folds)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+
+    for bar, loss in zip(bars, fold_losses):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f'{loss:.4f}', ha='center', va='bottom', fontsize=10)
+
+    # 准确率箱线图
+    plt.subplot(1, 4, 3)
+    box_data = [fold_accuracies]
+    box = plt.boxplot(box_data, patch_artist=True, showmeans=True)
+    box['boxes'][0].set_facecolor('lightblue')
+    box['means'][0].set_marker('D')
+    box['means'][0].set_markeredgecolor('red')
+    box['means'][0].set_markerfacecolor('red')
+
+    plt.title('Validation Accuracy Distribution', fontsize=14)
+    plt.ylabel('Accuracy (%)', fontsize=12)
+    plt.xticks([1], ['Cross-Validation'])
+    plt.grid(True, alpha=0.3)
+
+    stats_text = f'Mean: {np.mean(fold_accuracies):.2f}%\nStd: {np.std(fold_accuracies):.2f}%\nMin: {np.min(fold_accuracies):.2f}%\nMax: {np.max(fold_accuracies):.2f}%'
+    plt.text(1.1, np.mean(fold_accuracies), stats_text, fontsize=10,
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    # 推理时间柱状图
+    plt.subplot(1, 4, 4)
+    bars = plt.bar(folds, fold_inference_times, alpha=0.8, color='green')
+    plt.axhline(y=np.mean(fold_inference_times), color='r', linestyle='--',
+                linewidth=2, label=f'Mean: {np.mean(fold_inference_times):.6f}s')
+    plt.title('Avg Inference Time per Sample per Fold', fontsize=14)
+    plt.xlabel('Fold', fontsize=12)
+    plt.ylabel('Inference Time (seconds)', fontsize=12)
+    plt.xticks(folds)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+
+    for bar, t in zip(bars, fold_inference_times):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.00001,
+                 f'{t:.6f}', ha='center', va='bottom', fontsize=10)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()  # 显示绘图窗口
+    print(f"Cross-validation results saved to: {save_path}")
+
+
+def plot_confusion_matrix_for_fold(all_labels, all_preds, label_encoder, fold, save_dir='models/zq_cv'):
+    """绘制单次折叠的混淆矩阵"""
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 计算混淆矩阵
+    cm = confusion_matrix(all_labels, all_preds)
+
+    # 使用标签编码器获取类别名称
+    class_names = [str(int(label_encoder.inverse_transform([i])[0])) + '%' for i in range(len(label_encoder.classes_))]
+
+    # 绘制混淆矩阵
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title(f'Confusion Matrix - Fold {fold + 1}')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+
+    save_path = os.path.join(save_dir, f'fold_{fold + 1}_confusion_matrix.png')
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Confusion matrix for Fold {fold + 1} saved to: {save_path}")
+
+
+# ==================================================
+# 6. 计算模型大小
+# ==================================================
+def calculate_model_size(model):
+    """计算模型的大小（字节）。"""
+    buf = io.BytesIO()
+    torch.save(model.state_dict(), buf)
+    size = len(buf.getvalue())
+    return size  # 大小（字节）
+
+
+# ==================================================
+# 7. 主流程 (5折交叉验证)
+# ==================================================
+if __name__ == '__main__':
+    # 设备配置
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # 配置参数
+    config = {
+        'n_folds': 5,
+        'num_epochs': 50,
+        'batch_size': 16,
+        'learning_rate': 0.001,
+        'random_seed': 42,
+        'save_dir': 'models/zq_cv'
+    }
+
+    # 创建保存目录
+    os.makedirs(config['save_dir'], exist_ok=True)
+
+    # 数据变换
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # Step 1: 初始化特征提取器
+    feature_extractor = FeatureExtractor().to(device)
+    feature_extractor.eval()  # 设置为评估模式
+
+    # --- 步骤 2a: 直接从频谱数据中提取特征 ---
+    print("=" * 60)
+    print("Extracting features from spectra...")
+    base_dir = 'D:/电谱/Manuscript and cover letter/JFCA/Physicofuse/data/data-1080'
+    spectra_dir = os.path.join(base_dir, 'spectra')
+    frequencies = [100, 500, 1000, 3000, 8000, 15000, 50000, 200000]
+    features_list = ['CP', 'CS', 'Z', 'Φ', 'R', 'X']
+
+    # 存储从频谱中提取的特征和标签
+    spectra_features = {}
+    concentrations = set()
+
+    for filename in os.listdir(spectra_dir):
+        if not filename.endswith('.xlsx'):
+            continue
+
+        sample_id = filename.replace('.xlsx', '')
+        file_path = os.path.join(spectra_dir, filename)
+
+        try:
+            df = pd.read_excel(file_path)
+            concentration_raw = df['卡拉胶含量'].iloc[0]
+            conc_percent = int(concentration_raw * 100)
+            concentrations.add(conc_percent)
+
+            # 创建特征矩阵 (8 frequencies x 6 features)
+            feature_matrix = np.zeros((len(frequencies), len(features_list)))
+
+            # 填充矩阵
+            for i, freq in enumerate(frequencies):
+                for j, feat in enumerate(features_list):
+                    col_name = f"{feat}_{freq}"
+                    feature_matrix[i, j] = df[col_name].iloc[0]
+
+            # 标准化
+            scaler = MinMaxScaler()
+            normalized_matrix = scaler.fit_transform(feature_matrix)
+
+            # 展平为特征向量
+            flattened_features = normalized_matrix.flatten()
+
+            # 存储特征和浓度
+            spectra_features[sample_id] = {
+                'features': flattened_features,
+                'concentration': conc_percent
+            }
+
+        except Exception as e:
+            print(f"Error processing spectra sample {filename}: {e}")
+            continue
+
+    print(f"Extracted spectra features for {len(spectra_features)} samples.")
+    print(f"Unique concentrations found in spectra: {sorted(list(concentrations))}")
+
+    # --- 步骤 2b: 提取RGB图像特征 ---
+    print("\nExtracting features from RGB images...")
+    rgb_image_map = {}
+    label_base_dir = os.path.join(base_dir, 'labels')
+    image_base_dir = os.path.join(base_dir, 'images')
+
+    # 读取标签
+    for filename in os.listdir(label_base_dir):
+        if filename.lower().endswith('.txt'):
+            sample_id = filename.rsplit('.', 1)[0]
+            label_file = os.path.join(label_base_dir, filename)
+            try:
+                with open(label_file, 'r') as f:
+                    line = f.readline().strip()
+                match = re.search(r'(\d+)', line)
+                if match:
+                    concentration = int(match.group(1))
+                    rgb_image_map[sample_id] = {
+                        'concentration': concentration,
+                        'image_path': os.path.join(image_base_dir, f"{sample_id}.jpg")  # 假设图片是PNG格式
+                    }
+                else:
+                    print(
+                        f"Warning: Could not parse concentration from label file '{label_file}'. Content: '{line}'. Skipping.")
+                    continue
+            except Exception as e:
+                print(f"Error reading label file {label_file}: {e}. Skipping.")
+                continue
+
+    print(f"Found labels for {len(rgb_image_map)} samples.")
+    unique_rgb_concs = set([v['concentration'] for v in rgb_image_map.values()])
+    print(f"Unique concentrations found in RGB labels: {sorted(list(unique_rgb_concs))}")
+
+    # --- 步骤 3: 合并特征 ---
+    print("\nMerging spectra and RGB features...")
+    all_combined_features = []
+    all_labels = []
+
+    # 找到同时存在于频谱数据和RGB数据中的样本
+    common_samples = set(spectra_features.keys()).intersection(set(rgb_image_map.keys()))
+    print(f"Found {len(common_samples)} common samples between spectra and RGB data.")
+
+    for sample_id in common_samples:
+        # 获取频谱特征
+        spec_feat = spectra_features[sample_id]['features']
+        spec_conc = spectra_features[sample_id]['concentration']
+
+        # 获取RGB信息
+        rgb_info = rgb_image_map[sample_id]
+        rgb_conc = rgb_info['concentration']
+        rgb_path = rgb_info['image_path']
+
+        # 检查标签是否一致 (可选，但建议)
+        if spec_conc != rgb_conc:
+            print(
+                f"Warning: Concentration mismatch for sample {sample_id}: Spectra={spec_conc}%, RGB label={rgb_conc}%. Using Spectra value.")
+            # 或者可以选择跳过不一致的样本: continue
+
+        if not os.path.exists(rgb_path):
+            print(f"Warning: RGB image file does not exist: {rgb_path}. Skipping {sample_id}.")
+            continue
+
+        try:
+            rgb_img = Image.open(rgb_path).convert('RGB')
+            rgb_tensor = transform(rgb_img).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                rgb_features = feature_extractor(rgb_tensor).cpu().numpy()
+        except Exception as e:
+            print(f"Error processing RGB image {rgb_path}: {e}. Skipping {sample_id}.")
+            continue
+
+        # 拼接特征 (频谱特征向量 + RGB特征向量)
+        combined_features = np.concatenate((spec_feat, rgb_features.squeeze()))
+
+        # 使用频谱数据中的浓度作为最终标签
+        label = spec_conc
+
+        all_combined_features.append(combined_features)
+        all_labels.append(label)
+
+    # 检查是否成功处理了样本
+    if len(all_combined_features) == 0:
+        print("Error: No samples had both valid spectra and RGB image data!")
+        exit(1)
+
+    # 转换为numpy数组
+    features_array = np.array(all_combined_features)
+    labels_array = np.array(all_labels)
+
+    print(f"\nFeature extraction and merging completed:")
+    print(f"Combined Features shape: {features_array.shape}")  # Shape should be (N, 48+2048) or similar
+    print(f"Labels shape: {labels_array.shape}")
+    print(f"Unique labels before encoding: {sorted(list(set(labels_array)))}")
+
+    # 创建标签编码器
+    label_encoder = LabelEncoder()
+    # 使用所有可能的标签来拟合编码器，确保所有标签都被覆盖
+    all_possible_labels = sorted(list(set(labels_array)))  # 或者使用 spectra_concentrations 和 rgb_concentrations 的并集
+    label_encoder.fit(all_possible_labels)
+    # 然后用它来转换我们实际有的标签
+    labels_encoded = label_encoder.transform(labels_array)
+
+    label_mapping = dict(zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_)))
+    print(f"Label encoding mapping: {label_mapping}")
+    print(f"Encoded labels range: {labels_encoded.min()} to {labels_encoded.max()}")
+    print(f"Number of classes: {len(label_encoder.classes_)}")
+
+    # 保存标签编码器和映射信息
+    label_encoder_path = os.path.join(config['save_dir'], 'label_encoder.pkl')
+    joblib.dump(label_encoder, label_encoder_path)
+    print(f"Label encoder saved to: {label_encoder_path}")
+
+    label_mapping_path = os.path.join(config['save_dir'], 'label_mapping.txt')
+    with open(label_mapping_path, 'w') as f:
+        for original, encoded in label_mapping.items():
+            f.write(f"{original}% -> {encoded}\n")
+    print(f"Label mapping info saved to: {label_mapping_path}")
+
+    # Step 4: 5折交叉验证
+    print("\n" + "=" * 60)
+    print("Starting 5-Fold Cross Validation...")
+    print("=" * 60)
+
+    # 初始化分层K折
+    skf = StratifiedKFold(n_splits=config['n_folds'], shuffle=True, random_state=config['random_seed'])
+
+    # 存储每折的结果
+    fold_results = []
+    fold_accuracies = []
+    fold_losses = []
+    fold_inference_times = []  # 存储推理时间用于绘图
+    fold_model_sizes = []  # 存储模型大小用于汇总
+
+    # 循环处理每一折
+    for fold, (train_idx, val_idx) in enumerate(skf.split(features_array, labels_encoded)):  # 使用编码后的标签
+        print(f"\n{'=' * 60}")
+        print(f"Fold {fold + 1}/{config['n_folds']}")
+        print(f"{'=' * 60}")
+        print(f"Training samples: {len(train_idx)}, Validation samples: {len(val_idx)}")
+
+        # 划分训练集和验证集 (使用编码后的标签)
+        train_features = features_array[train_idx]
+        train_labels = labels_encoded[train_idx]
+
+        val_features = features_array[val_idx]
+        val_labels = labels_encoded[val_idx]
+
+        # 转换为PyTorch张量
+        train_features_tensor = torch.tensor(train_features, dtype=torch.float32)
+        train_labels_tensor = torch.tensor(train_labels, dtype=torch.long)
+
+        val_features_tensor = torch.tensor(val_features, dtype=torch.float32)
+        val_labels_tensor = torch.tensor(val_labels, dtype=torch.long)
+
+        # 创建数据集
+        train_dataset = FeatureDataset(train_features_tensor, train_labels_tensor)
+        val_dataset = FeatureDataset(val_features_tensor, val_labels_tensor)
+
+        # 创建数据加载器
+        train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False)
+
+        # 初始化模型 (每折重新初始化)
+        num_classes = len(label_encoder.classes_)  # 确保 num_classes 是正确的
+        input_size = features_array.shape[1]  # 应该是 48 (spectra) + 2048 (RGB) = 2096
+
+        model = FeatureClassifier(input_size, num_classes).to(device)
+
+        # --- 计算初始模型大小 ---
+        initial_model_size_bytes = calculate_model_size(model)
+        initial_model_size_mb = initial_model_size_bytes / (1024 * 1024)  # 转换为MB
+        print(
+            f"Initial model size for Fold {fold + 1}: {initial_model_size_mb:.4f} MB ({initial_model_size_bytes} bytes)")
+        # ------------------------------------
+
+        # 损失函数和优化器
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+
+        # 训练循环
+        print(f"\nStarting training for Fold {fold + 1}...")
+        best_val_acc = 0.0
+        best_model_state = None
+        best_avg_inference_time = float('inf')  # 追踪最佳模型的推理时间
+
+        train_losses_history = []
+        val_losses_history = []
+        train_accs_history = []
+        val_accs_history = []
+
+        for epoch in range(config['num_epochs']):
+            # 训练
+            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+
+            # 验证
+            val_loss, val_acc, val_preds, val_true, avg_inf_time = validate(model, val_loader, criterion, device)
+
+            # 记录历史
+            train_losses_history.append(train_loss)
+            val_losses_history.append(val_loss)
+            train_accs_history.append(train_acc)
+            val_accs_history.append(val_acc)
+
+            # 打印进度
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(f'Epoch [{epoch + 1}/{config["num_epochs"]}], '
+                      f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
+                      f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, '
+                      f'Avg Inf Time: {avg_inf_time:.6f}s')
+
+            # 根据验证准确率保存最佳模型状态
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_val_loss = val_loss
+                best_avg_inference_time = avg_inf_time  # 当最佳准确率达成时更新推理时间
+                best_epoch = epoch + 1
+                best_model_state = copy.deepcopy(model.state_dict())
+                best_val_preds = val_preds
+                best_val_true = val_true
+
+        # 当前折训练结束
+        print(f"\nFold {fold + 1} training completed:")
+        print(f"Best Validation Accuracy: {best_val_acc:.2f}% (at Epoch {best_epoch})")
+        print(f"Best Validation Loss: {best_val_loss:.4f}")
+        print(f"Best Model Avg Inference Time: {best_avg_inference_time:.6f}s")
+
+        # 计算最佳模型状态的大小 (通常与初始大小相似)
+        best_model_size_bytes = calculate_model_size(model)  # 因为架构相同，大小基本一致
+        best_model_size_mb = best_model_size_bytes / (1024 * 1024)
+        fold_model_sizes.append(best_model_size_mb)
+        print(f"Best model size for Fold {fold + 1}: {best_model_size_mb:.4f} MB ({best_model_size_bytes} bytes)")
+
+        # 保存当前折的最佳模型
+        model_path = os.path.join(config['save_dir'], f'fold_{fold + 1}_best_model.pth')
+        torch.save({
+            'epoch': best_epoch,
+            'model_state_dict': best_model_state,
+            'val_acc': best_val_acc,
+            'val_loss': best_val_loss,
+            'input_size': input_size,
+            'num_classes': num_classes,
+            'training_history': {
+                'train_losses': train_losses_history,
+                'val_losses': val_losses_history,
+                'train_accuracies': train_accs_history,
+                'val_accuracies': val_accs_history
+            },
+            'inference_time': best_avg_inference_time,  # 将推理时间保存到检查点
+            'model_size_mb': best_model_size_mb,  # 将模型大小保存到检查点
+            'model_size_bytes': best_model_size_bytes  # 将模型大小保存到检查点
+        }, model_path)
+        print(f"Best model for Fold {fold + 1} saved to: {model_path}")
+
+        # 绘制此折的训练曲线
+        plot_loss_curves(train_losses_history, val_losses_history,
+                         train_accs_history, val_accs_history, fold, config['save_dir'])
+
+        # 绘制此折的混淆矩阵
+        plot_confusion_matrix_for_fold(best_val_true, best_val_preds, label_encoder, fold, config['save_dir'])
+
+        # 存储此折的结果
+        fold_results.append({
+            'fold': fold + 1,
+            'best_val_acc': best_val_acc,
+            'best_val_loss': best_val_loss,
+            'best_avg_inference_time': best_avg_inference_time,
+            'best_model_size_mb': best_model_size_mb,
+            'best_epoch': best_epoch,
+            'train_size': len(train_idx),
+            'val_size': len(val_idx)
+        })
+
+        fold_accuracies.append(best_val_acc)
+        fold_losses.append(best_val_loss)
+        fold_inference_times.append(best_avg_inference_time)  # 添加推理时间到列表用于绘图
+
+    # 所有折完成
+    print("\n" + "=" * 60)
+    print("5-Fold Cross Validation Complete!")
+    print("=" * 60)
+
+    # 计算统计信息
+    avg_val_acc = np.mean(fold_accuracies)
+    std_val_acc = np.std(fold_accuracies)
+    avg_val_loss = np.mean(fold_losses)
+    avg_inference_time = np.mean(fold_inference_times)
+    std_inference_time = np.std(fold_inference_times)
+    avg_model_size_mb = np.mean(fold_model_sizes)
+    std_model_size_mb = np.std(fold_model_sizes)
+
+    # 打印详细结果
+    print("\n5-Fold Cross Validation Results:")
+    print("-" * 80)
+    for result in fold_results:
+        print(f"Fold {result['fold']}: "
+              f"Val Acc={result['best_val_acc']:.2f}%, "
+              f"Val Loss={result['best_val_loss']:.4f}, "
+              f"Inf Time={result['best_avg_inference_time']:.6f}s, "
+              f"Model Size={result['best_model_size_mb']:.4f}MB, "
+              f"Best Epoch={result['best_epoch']}, "
+              f"Train Samples={result['train_size']}, "
+              f"Val Samples={result['val_size']}")
+
+    print("-" * 80)
+    print(f"Average Validation Accuracy: {avg_val_acc:.2f}% ± {std_val_acc:.2f}%")
+    print(f"Average Validation Loss: {avg_val_loss:.4f}")
+    print(f"Average Inference Time (per sample): {avg_inference_time:.6f}s ± {std_inference_time:.6f}s")
+    print(f"Average Model Size: {avg_model_size_mb:.4f}MB ± {std_model_size_mb:.4f}MB")
+    print(f"Best Single Fold Accuracy: {max(fold_accuracies):.2f}%")
+    print(f"Worst Single Fold Accuracy: {min(fold_accuracies):.2f}%")
+
+    # 保存交叉验证结果到CSV
+    results_df = pd.DataFrame(fold_results)
+    results_csv_path = os.path.join(config['save_dir'], 'cross_validation_results.csv')
+    results_df.to_csv(results_csv_path, index=False)
+    print(f"\nCross-validation results saved to: {results_csv_path}")
+
+    # 保存汇总信息
+    summary_path = os.path.join(config['save_dir'], 'cv_summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write("5-Fold Cross Validation Summary\n")
+        f.write("=" * 40 + "\n\n")
+        f.write(f"Total Samples: {len(labels_array)}\n")
+        f.write(f"Number of Classes: {num_classes}\n")
+        f.write(f"Class Distribution: {dict(zip(*np.unique(labels_encoded, return_counts=True)))}\n\n")
+
+        f.write("Results per Fold:\n")
+        for result in fold_results:
+            f.write(f"Fold {result['fold']}: Val Acc={result['best_val_acc']:.2f}%, "
+                    f"Val Loss={result['best_val_loss']:.4f}, "
+                    f"Inf Time={result['best_avg_inference_time']:.6f}s, "
+                    f"Size={result['best_model_size_mb']:.4f}MB, "
+                    f"Best Epoch={result['best_epoch']}\n")
+
+        f.write("\nSummary Statistics:\n")
+        f.write(f"Mean Val Accuracy: {avg_val_acc:.2f}%\n")
+        f.write(f"Accuracy Std Dev: {std_val_acc:.2f}%\n")
+        f.write(f"Mean Val Loss: {avg_val_loss:.4f}\n")
+        f.write(f"Mean Inference Time (per sample): {avg_inference_time:.6f}s\n")
+        f.write(f"Inference Time Std Dev: {std_inference_time:.6f}s\n")
+        f.write(f"Mean Model Size: {avg_model_size_mb:.4f}MB\n")
+        f.write(f"Model Size Std Dev: {std_model_size_mb:.4f}MB\n")
+        f.write(f"Best Single Fold Acc: {max(fold_accuracies):.2f}%\n")
+        f.write(f"Worst Single Fold Acc: {min(fold_accuracies):.2f}%\n")
+
+    print(f"Summary information saved to: {summary_path}")
+
+    # 绘制总体交叉验证结果 (包括推理时间)
+    plot_cross_validation_results(fold_accuracies, fold_losses, fold_inference_times, config['save_dir'])
+
+    # 打印最终摘要
+    print("\nTraining Summary:")
+    print(f"Mean Val Accuracy: {avg_val_acc:.2f}% ± {std_val_acc:.2f}%")
+    print(f"Mean Val Loss: {avg_val_loss:.4f}")
+    print(f"Mean Inference Time (per sample): {avg_inference_time:.6f}s ± {std_inference_time:.6f}s")
+    print(f"Mean Model Size: {avg_model_size_mb:.4f}MB ± {std_model_size_mb:.4f}MB")
+    print(f"5-Fold Cross Validation finished!")
