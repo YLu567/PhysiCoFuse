@@ -1,773 +1,522 @@
-import os
-import pandas as pd
-import numpy as np
-import matplotlib
+# -*- coding: utf-8 -*-
+"""
+PhysiCoFuse 完整代码（加速 + 半精度模型保存）
+- 使用 EIS (8×6) + RGB 图像
+- 可学习 PPMG (生成 4 通道伪生理属性图)
+- 7 通道输入 ResNet50 (RGB + 4 伪图)
+- MIE + CMPC + 分类器
+- 5 折 Stratified Cross-Validation
+- 数据增强 (仅训练集)
+- 进度条可视化 (tqdm)
+- 冻结 ResNet 浅层 (加速)
+- 混合精度训练 (若 GPU 可用)
+- 加速设置：较大 batch size、cudnn.benchmark、减少验证频率、prefetch
+- 模型保存为半精度 (float16)，显著减小 pth 文件大小
+"""
 
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler, LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
+import os
+import re
+import random
+import warnings
+import numpy as np
+import pandas as pd
 from PIL import Image
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler  # 添加 MinMaxScaler
+from sklearn.model_selection import StratifiedKFold
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.models import resnet50, ResNet50_Weights
-import warnings
-import time
-import re
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings('ignore')
 
+# ====================== 全局配置 ======================
+SEED = 42
+N_SPLITS = 5
+BATCH_SIZE = 32               # 增大 batch size（显存不足可调为 24 或 16）
+EPOCHS = 50
+LR_MAIN = 1e-3                # 分类器 / ResNet 学习率（微调）
+LR_OTHER = 2e-4               # MIE, PPMG, CMPC 学习率
+WEIGHT_DECAY = 1e-4
+PATIENCE = 10                  # 早停耐心
+CONSISTENCY_WEIGHT = 0.01
+VALIDATION_INTERVAL = 2       # 每 2 个 epoch 验证一次，减少验证开销
 
-# ==================================================
-# 1. 生理属性定义与计算模块
-# ==================================================
-class PhysiologicalAttributes:
-    """生理属性计算器"""
+# 数据目录（修改为您的实际路径）
+DATA_ROOT = './data'
+SPECTRA_DIR = os.path.join(DATA_ROOT, 'spectra')
+LABELS_DIR = os.path.join(DATA_ROOT, 'labels')
+IMAGES_DIR = os.path.join(DATA_ROOT, 'images')
 
-    # 四个目标生理属性
-    ATTRIBUTE_NAMES = [
-        'water_content',  # 含水量 - 与导电性相关
-        'ion_concentration',  # 离子浓度 - 与电阻相关
-        'tissue_porosity',  # 组织孔隙率 - 与电容相关
-        'cell_integrity'  # 细胞完整性 - 与相位角相关
-    ]
+OUTPUT_DIR = './results'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # 目标属性索引（所有四个都保留）
-    TARGET_ATTRIBUTES = [0, 1, 2, 3]
+# 固定频率和特征名（与 Excel 列名一致）
+FREQUENCIES = [100, 500, 1000, 3000, 8000, 15000, 50000, 200000]
+FEATURES = ['CP', 'CS', 'Z', 'Φ', 'R', 'X']
 
-    @staticmethod
-    def calculate_from_eis(feature_matrix):
-        """
-        从EIS特征矩阵计算四个生理属性值
-        feature_matrix: [8频率, 6参数]
-        参数顺序: ['CP', 'CS', 'Z', 'Φ', 'R', 'X']
-        """
-        # 1. 含水量 - 与阻抗Z负相关，特别关注低频
-        low_freq_idx = [0, 1, 2]  # 100Hz, 500Hz, 1kHz
-        water_content = np.mean(1.0 / (feature_matrix[low_freq_idx, 2] + 1e-6))
-
-        # 2. 离子浓度 - 与电阻R负相关
-        mid_freq_idx = [3, 4]  # 3kHz, 8kHz
-        ion_concentration = np.mean(1.0 / (feature_matrix[mid_freq_idx, 4] + 1e-6))
-
-        # 3. 组织孔隙率 - 与电容参数CP/CS比值相关
-        tissue_porosity = np.mean(feature_matrix[:, 0] / (feature_matrix[:, 1] + 1e-6))
-
-        # 4. 细胞完整性 - 与相位角Φ相关
-        high_freq_idx = [5, 6, 7]  # 15kHz, 50kHz, 200kHz
-        cell_integrity = np.mean(np.abs(feature_matrix[high_freq_idx, 3]))
-
-        attributes = np.array([
-            water_content, ion_concentration, tissue_porosity, cell_integrity
-        ])
-
-        # 注意：这里不要全局归一化，避免数据泄露
-        # 只进行简单的数值稳定处理
-        attributes = np.clip(attributes, 1e-8, None)
-
-        return attributes
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# ==================================================
-# 2. 谱数据处理与伪图生成（修复数据泄露）
-# ==================================================
-def generate_pseudo_images_per_sample():
-    """为每个样本生成伪图和生理属性 - 避免数据泄露"""
-    spectra_dir = './data_train-54/spectra/'
-    images_dir = './data_train-54/images/'
-    labels_dir = './data_train-54/labels/'
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 关闭确定性以启用 cuDNN 自动优化（提升速度）
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+set_seed()
 
-    # 检查目录是否存在
-    if not all(os.path.exists(d) for d in [spectra_dir, images_dir, labels_dir]):
-        print("错误: 数据目录不存在!")
-        return {}, {}, {}
+# ====================== 数据加载 ======================
+def load_data_from_directories(spectra_dir, labels_dir, images_dir):
+    xlsx_files = [f for f in os.listdir(spectra_dir) if f.lower().endswith('.xlsx')]
+    if not xlsx_files:
+        raise FileNotFoundError(f"在 {spectra_dir} 中未找到任何 .xlsx 文件")
+    sample_ids = [os.path.splitext(f)[0] for f in xlsx_files]
+    print(f"找到 {len(sample_ids)} 个样本")
 
-    # 创建输出目录
-    output_dir = './pseudo_images/54'
-    os.makedirs(output_dir, exist_ok=True)
+    rgb_paths = []
+    eis_matrices = []
+    concentrations = []
 
-    frequencies = [100, 500, 1000, 3000, 8000, 15000, 50000, 200000]
-    features = ['CP', 'CS', 'Z', 'Φ', 'R', 'X']
-
-    sample_id_map = {}
-    spectral_data_map = {}
-    physiological_attr_map = {}
-
-    # 获取所有频谱文件
-    spectra_files = sorted([f for f in os.listdir(spectra_dir) if f.endswith('.xlsx')])
-    print(f"找到 {len(spectra_files)} 个频谱文件")
-
-    # 先收集所有样本信息
-    sample_infos = []
-    for spectra_file in spectra_files:
-        sample_id = os.path.splitext(spectra_file)[0]
-        spectra_path = os.path.join(spectra_dir, spectra_file)
-
-        # 读取浓度
-        label_path = os.path.join(labels_dir, f"{sample_id}.txt")
-        concentration = None
-
-        if os.path.exists(label_path):
-            try:
-                with open(label_path, 'r') as f:
-                    label_content = f.read().strip()
-                    match = re.search(r'(\d+(\.\d+)?)%', label_content)
-                    if match:
-                        concentration = float(match.group(1))
-                    else:
-                        concentration = float(label_content.replace('%', ''))
-            except:
-                pass
-
-        if concentration is None:
-            try:
-                conc_str = sample_id.split('_')[0].replace('%', '')
-                concentration = float(conc_str)
-            except:
-                print(f"跳过样本 {sample_id}: 无法提取浓度")
-                continue
-
-        # 检查图像是否存在
-        rgb_image_path = None
-        for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
-            test_path = os.path.join(images_dir, f"{sample_id}{ext}")
-            if os.path.exists(test_path):
-                rgb_image_path = test_path
-                break
-
-        sample_infos.append({
-            'sample_id': sample_id,
-            'spectra_path': spectra_path,
-            'concentration': concentration,
-            'rgb_image_path': rgb_image_path
-        })
-
-    print(f"成功读取 {len(sample_infos)} 个样本信息")
-
-    # 为每个样本生成伪图和生理属性（避免使用全局统计信息）
-    for info in sample_infos:
-        sample_id = info['sample_id']
-
+    for sid in tqdm(sample_ids, desc="加载样本"):
+        # 标签
+        label_file = os.path.join(labels_dir, sid + '.txt')
+        if not os.path.exists(label_file):
+            continue
         try:
-            # 读取频谱数据
-            df = pd.read_excel(info['spectra_path'])
+            with open(label_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            match = re.search(r'(\d+(\.\d+)?)%?', content)
+            conc = float(match.group(1)) if match else float(content)
+            concentration = int(conc)
+        except:
+            continue
 
-            # 创建特征矩阵
-            feature_matrix = np.zeros((len(frequencies), len(features)))
-
-            for i, freq in enumerate(frequencies):
-                for j, feat in enumerate(features):
+        # EIS
+        spec_file = os.path.join(spectra_dir, sid + '.xlsx')
+        try:
+            df = pd.read_excel(spec_file)
+            mat = np.zeros((len(FREQUENCIES), len(FEATURES)), dtype=np.float32)
+            for i, freq in enumerate(FREQUENCIES):
+                for j, feat in enumerate(FEATURES):
                     col_name = f"{feat}_{freq}"
-                    if col_name in df.columns:
-                        feature_matrix[i, j] = df[col_name].iloc[0]
-                    else:
-                        col_name_alt = f"{feat}{freq}"
-                        if col_name_alt in df.columns:
-                            feature_matrix[i, j] = df[col_name_alt].iloc[0]
+                    if col_name not in df.columns:
+                        col_name2 = f"{feat}{freq}"
+                        if col_name2 in df.columns:
+                            val = df[col_name2].iloc[0]
                         else:
-                            feature_matrix[i, j] = 0.0
+                            raise KeyError
+                    else:
+                        val = df[col_name].iloc[0]
+                    mat[i, j] = float(val)
+        except:
+            continue
 
-            # 存储原始谱数据
-            spectral_data_map[sample_id] = feature_matrix.copy()
+        # 图像
+        img_path = None
+        for ext in ['.jpg', '.jpeg', '.png']:
+            candidate = os.path.join(images_dir, sid + ext)
+            if os.path.exists(candidate):
+                img_path = candidate
+                break
+        if img_path is None:
+            continue
 
-            # 计算生理属性（不使用全局归一化）
-            phys_attributes = PhysiologicalAttributes.calculate_from_eis(feature_matrix)
-            physiological_attr_map[sample_id] = phys_attributes
+        rgb_paths.append(img_path)
+        eis_matrices.append(mat)
+        concentrations.append(concentration)
 
-            # 使用样本自身的统计信息进行归一化，避免数据泄露
-            min_val = np.min(feature_matrix)
-            max_val = np.max(feature_matrix)
-            if max_val > min_val:
-                normalized_matrix = (feature_matrix - min_val) / (max_val - min_val)
-            else:
-                normalized_matrix = np.zeros_like(feature_matrix)
+    if len(rgb_paths) == 0:
+        raise RuntimeError("未成功加载任何样本，请检查数据")
+    label_encoder = LabelEncoder()
+    labels = label_encoder.fit_transform(concentrations)
+    print(f"浓度类别: {label_encoder.classes_}")
+    print(f"总样本数: {len(rgb_paths)}")
+    return rgb_paths, eis_matrices, labels, label_encoder
 
-            # 创建伪图
-            plt.figure(figsize=(8, 6))
-            plt.imshow(normalized_matrix, cmap='viridis', aspect='auto')
-            plt.colorbar(label='Normalized Value')
-            plt.title(f'Sample: {sample_id}, Conc: {int(info["concentration"])}%')
-            plt.xlabel('Features')
-            plt.ylabel('Frequency (Hz)')
-            plt.xticks(range(len(features)), features)
-            plt.yticks(range(len(frequencies)), [str(f) for f in frequencies])
+# ====================== 数据集类 ======================
+class PhysiCoFuseDataset(Dataset):
+    def __init__(self, rgb_paths, eis_matrices, labels, transform=None):
+        self.rgb_paths = rgb_paths
+        self.eis_matrices = eis_matrices
+        self.labels = labels
+        self.transform = transform
 
-            # 保存伪图
-            image_path = os.path.join(output_dir, f'{sample_id}.png')
-            plt.savefig(image_path, dpi=150, bbox_inches='tight')
-            plt.close()
+    def __len__(self):
+        return len(self.rgb_paths)
 
-            sample_id_map[sample_id] = {
-                'concentration': int(info['concentration']),
-                'image_path': image_path,
-                'phys_attributes': phys_attributes,
-                'rgb_image_path': info['rgb_image_path']
-            }
+    def __getitem__(self, idx):
+        rgb = Image.open(self.rgb_paths[idx]).convert('RGB')
+        if self.transform:
+            rgb = self.transform(rgb)
+        else:
+            rgb = transforms.ToTensor()(rgb)
+        eis = torch.tensor(self.eis_matrices[idx], dtype=torch.float32)
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return rgb, eis, label
 
-        except Exception as e:
-            print(f"处理样本 {sample_id} 时出错: {e}")
-
-    print(f"\n总计成功处理 {len(sample_id_map)} 个样本")
-    return sample_id_map, spectral_data_map, physiological_attr_map
-
-
-# ==================================================
-# 3. 增强多属性组合模型（简化版，减少过拟合风险）
-# ==================================================
-class EnhancedMultiAttributeModel(nn.Module):
-    """用于评估多个生理属性组合的增强模型 - 简化结构"""
-
-    def __init__(self, input_dim=2048 * 2, num_attributes=4, num_classes=9, dropout_rate=0.5):
+# ====================== 模型组件（论文架构，完全不变） ======================
+class MultiFrequencyImpedanceEncoder(nn.Module):
+    def __init__(self, num_freq=8, num_params=6, feat_dim=128):
         super().__init__()
-        # 简化特征提取
-        self.feature_extractor = nn.Sequential(
+        self.conv1 = nn.Conv1d(num_params, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(256)
+        self.final_freq_dim = num_freq // 4
+        self.freq_attention = nn.Sequential(
+            nn.Linear(self.final_freq_dim, self.final_freq_dim),
+            nn.ReLU(),
+            nn.Linear(self.final_freq_dim, self.final_freq_dim),
+            nn.Softmax(dim=1)
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, feat_dim)
+        )
+        self.feat_dim = feat_dim
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.max_pool1d(x, 2)
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.max_pool1d(x, 2)
+        x = F.relu(self.bn3(self.conv3(x)))
+        attn_in = x.mean(dim=1)
+        attn_weights = self.freq_attention(attn_in)
+        attn_weights = attn_weights.unsqueeze(1)
+        x = x * attn_weights
+        x = x.mean(dim=2)
+        return self.fc(x), attn_weights.squeeze(1)
+
+class PseudoBiophysicalMapGenerator(nn.Module):
+    def __init__(self, imp_feat_dim=128, num_attrs=4, map_size=224):
+        super().__init__()
+        self.num_attrs = num_attrs
+        self.map_size = map_size
+        self.fc1 = nn.Linear(imp_feat_dim, 256)
+        self.fc2 = nn.Linear(256, num_attrs)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, imp_feat):
+        h = F.relu(self.fc1(imp_feat))
+        attr_scores = self.sigmoid(self.fc2(h))
+        attr_maps = attr_scores.view(-1, self.num_attrs, 1, 1)
+        attr_maps = attr_maps.expand(-1, -1, self.map_size, self.map_size)
+        return attr_maps, attr_scores
+
+class ResNet50_7ch(nn.Module):
+    def __init__(self, freeze_layers=True):
+        super().__init__()
+        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        old_conv = resnet.conv1
+        new_conv = nn.Conv2d(7, old_conv.out_channels,
+                             kernel_size=old_conv.kernel_size,
+                             stride=old_conv.stride,
+                             padding=old_conv.padding,
+                             bias=old_conv.bias is not None)
+        with torch.no_grad():
+            new_conv.weight[:, :3] = old_conv.weight
+            new_conv.weight[:, 3:] = old_conv.weight.mean(dim=1, keepdim=True).repeat(1, 4, 1, 1)
+        resnet.conv1 = new_conv
+        self.features = nn.Sequential(*list(resnet.children())[:-1])
+        self.out_dim = 2048
+
+        if freeze_layers:
+            for i, child in enumerate(self.features.children()):
+                if i < 5:   # 前5个模块 (conv1 ~ layer3)
+                    for param in child.parameters():
+                        param.requires_grad = False
+
+    def forward(self, x):
+        x = self.features(x)
+        return x.squeeze(-1).squeeze(-1)
+
+class CrossModalPhysicalConsistency(nn.Module):
+    def __init__(self, img_feat_dim=2048, imp_feat_dim=128, num_attrs=4, fused_dim=512):
+        super().__init__()
+        self.num_attrs = num_attrs
+        self.img_to_phys = nn.Sequential(
+            nn.Linear(img_feat_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Linear(512, num_attrs)
+        )
+        self.imp_to_phys = nn.Sequential(
+            nn.Linear(imp_feat_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Linear(256, num_attrs)
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(img_feat_dim + imp_feat_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(1024, fused_dim),
+            nn.BatchNorm1d(fused_dim),
+            nn.ReLU()
+        )
+        self.fused_dim = fused_dim
+
+    def forward(self, img_feat, imp_feat):
+        img_phys = self.img_to_phys(img_feat)
+        imp_phys = self.imp_to_phys(imp_feat)
+        consistency_loss = F.mse_loss(img_phys, imp_phys)
+        fused = torch.cat([img_feat, imp_feat], dim=1)
+        fused = self.fusion(fused)
+        return fused, consistency_loss
+
+class FeatureClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.classifier = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(dropout_rate),
+            nn.Dropout(0.5),
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.7)
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
         )
 
-        # 属性融合（简化）
-        self.attribute_fusion = nn.Sequential(
-            nn.Linear(256 + num_attributes, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.5)
+    def forward(self, x):
+        return self.classifier(x)
+
+class PhysiCoFuse(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.mie = MultiFrequencyImpedanceEncoder()
+        self.ppmg = PseudoBiophysicalMapGenerator(imp_feat_dim=self.mie.feat_dim)
+        self.resnet = ResNet50_7ch(freeze_layers=True)
+        self.cmpc = CrossModalPhysicalConsistency(
+            img_feat_dim=self.resnet.out_dim,
+            imp_feat_dim=self.mie.feat_dim
+        )
+        self.classifier = FeatureClassifier(
+            input_dim=self.cmpc.fused_dim,
+            num_classes=num_classes
         )
 
-        # 分类器（简化）
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes)
-        )
+    def forward(self, rgb, eis, return_consistency=False):
+        imp_feat, _ = self.mie(eis)
+        pseudo_maps, _ = self.ppmg(imp_feat)
+        combined = torch.cat([rgb, pseudo_maps], dim=1)
+        img_feat = self.resnet(combined)
+        fused_feat, consistency_loss = self.cmpc(img_feat, imp_feat)
+        logits = self.classifier(fused_feat)
+        if return_consistency:
+            return logits, consistency_loss
+        return logits
 
-    def forward(self, x, attributes):
-        # 提取特征
-        features = self.feature_extractor(x)
+# ====================== 训练与验证 ======================
+def train_one_epoch(model, loader, optimizer, criterion, consistency_weight, epoch, scaler=None):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-        # 融合特征和属性
-        combined = torch.cat((features, attributes), dim=1)
-        fused = self.attribute_fusion(combined)
+    pbar = tqdm(loader, desc=f'Epoch {epoch+1} 训练', leave=False, ncols=100)
+    for rgb, eis, labels in pbar:
+        rgb, eis, labels = rgb.to(device), eis.to(device), labels.to(device)
+        optimizer.zero_grad()
 
-        # 分类
-        output = self.classifier(fused)
-        return output
-
-
-# ==================================================
-# 4. 数据集类（修复NoneType问题）
-# ==================================================
-class AttributeDataset(Dataset):
-    def __init__(self, features, labels, attributes=None, attribute_idx=None):
-        self.features = features
-        self.labels = labels
-        self.attributes = attributes
-        self.attribute_idx = attribute_idx
-
-        # 确保属性数据不为None
-        if self.attributes is not None and self.attribute_idx is not None:
-            self.selected_attributes = self.attributes[:, attribute_idx]
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                logits, cons_loss = model(rgb, eis, return_consistency=True)
+                class_loss = criterion(logits, labels)
+                loss = class_loss + consistency_weight * cons_loss
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            # 如果属性为None，创建零属性
-            self.selected_attributes = torch.zeros((len(features), 4), dtype=torch.float32)
+            logits, cons_loss = model(rgb, eis, return_consistency=True)
+            class_loss = criterion(logits, labels)
+            loss = class_loss + consistency_weight * cons_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-    def __len__(self):
-        return len(self.features)
+        total_loss += loss.item()
+        _, pred = logits.max(1)
+        correct += pred.eq(labels).sum().item()
+        total += labels.size(0)
 
-    def __getitem__(self, idx):
-        # 确保始终返回三个元素，且都不是None
-        features = self.features[idx]
-        labels = self.labels[idx]
-        attributes = self.selected_attributes[idx] if self.selected_attributes is not None else torch.zeros(4,
-                                                                                                            dtype=torch.float32)
+        current_acc = 100. * correct / total
+        pbar.set_postfix({'Loss': f'{loss.item():.4f}', 'Acc': f'{current_acc:.2f}%'})
 
-        return features, labels, attributes
+    avg_loss = total_loss / len(loader)
+    acc = 100. * correct / total
+    return avg_loss, acc
 
+def validate(model, loader, criterion, consistency_weight):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for rgb, eis, labels in tqdm(loader, desc='验证', leave=False, ncols=100):
+            rgb, eis, labels = rgb.to(device), eis.to(device), labels.to(device)
+            logits, cons_loss = model(rgb, eis, return_consistency=True)
+            loss = criterion(logits, labels) + consistency_weight * cons_loss
+            total_loss += loss.item()
+            _, pred = logits.max(1)
+            correct += pred.eq(labels).sum().item()
+            total += labels.size(0)
+    avg_loss = total_loss / len(loader)
+    acc = 100. * correct / total
+    return avg_loss, acc
 
-# ==================================================
-# 5. 直接训练评估器（无交叉验证）
-# ==================================================
-class DirectTrainer:
-    """直接训练模型 - 不使用交叉验证"""
+# ====================== 主程序 ======================
+def main():
+    print("加载数据...")
+    rgb_paths, eis_matrices, labels, label_encoder = load_data_from_directories(
+        SPECTRA_DIR, LABELS_DIR, IMAGES_DIR
+    )
+    num_classes = len(label_encoder.classes_)
 
-    def __init__(self, device='cuda'):
-        self.device = device
-        self.attribute_names = PhysiologicalAttributes.ATTRIBUTE_NAMES
+    # 保存原始EIS矩阵（用于生成热图，与第二段代码一致）
+    raw_eis_matrices = eis_matrices  # 原始未标准化矩阵
 
-    def train_directly(self, attribute_indices, features, labels, attributes,
-                       num_classes, epochs=100, learning_rate=1e-4, test_size=0.2, random_state=42):
-        """直接训练模型，划分训练/验证集"""
-        combo_names = [self.attribute_names[i] for i in attribute_indices]
-        print(f"\n{'=' * 60}")
-        print(f"直接训练 - 评估属性组合: {', '.join(combo_names)}")
-        print(f"属性索引: {attribute_indices}")
-        print(f"测试集比例: {test_size}")
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.3),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
 
-        # 划分训练集和验证集
-        X_train, X_val, y_train, y_val, P_train, P_val = train_test_split(
-            features, labels, attributes, test_size=test_size, stratify=labels, random_state=random_state
-        )
+    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+    fold_accs = []
 
-        print(f"训练集大小: {len(X_train)}, 验证集大小: {len(X_val)}")
+    use_amp = (device.type == 'cuda')
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
 
-        # 特征标准化 - 使用训练集统计信息，避免数据泄露
-        feature_scaler = StandardScaler()
-        X_train_scaled = feature_scaler.fit_transform(X_train)
-        X_val_scaled = feature_scaler.transform(X_val)
+    for fold, (train_idx, val_idx) in enumerate(skf.split(rgb_paths, labels)):
+        print(f"\n========== Fold {fold+1}/{N_SPLITS} ==========")
+        train_rgb = [rgb_paths[i] for i in train_idx]
+        val_rgb = [rgb_paths[i] for i in val_idx]
+        train_eis = [eis_matrices[i] for i in train_idx]
+        val_eis = [eis_matrices[i] for i in val_idx]
+        train_labels = [labels[i] for i in train_idx]
+        val_labels = [labels[i] for i in val_idx]
 
-        # 属性归一化 - 使用训练集统计信息
-        attribute_scaler = StandardScaler()
-        P_train_scaled = attribute_scaler.fit_transform(P_train[:, attribute_indices])
-        P_val_scaled = attribute_scaler.transform(P_val[:, attribute_indices])
+        # 标准化 EIS
+        train_eis_flat = np.array([mat.flatten() for mat in train_eis])
+        val_eis_flat = np.array([mat.flatten() for mat in val_eis])
+        scaler_eis = StandardScaler()
+        train_eis_scaled = scaler_eis.fit_transform(train_eis_flat)
+        val_eis_scaled = scaler_eis.transform(val_eis_flat)
+        train_eis_scaled = train_eis_scaled.reshape(-1, 8, 6)
+        val_eis_scaled = val_eis_scaled.reshape(-1, 8, 6)
 
-        # 转换为张量
-        X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
-        y_train_tensor = torch.tensor(y_train, dtype=torch.long)
-        P_train_tensor = torch.tensor(P_train_scaled, dtype=torch.float32)
-        X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32)
-        y_val_tensor = torch.tensor(y_val, dtype=torch.long)
-        P_val_tensor = torch.tensor(P_val_scaled, dtype=torch.float32)
+        train_dataset = PhysiCoFuseDataset(train_rgb, train_eis_scaled, train_labels, transform=train_transform)
+        val_dataset = PhysiCoFuseDataset(val_rgb, val_eis_scaled, val_labels, transform=val_transform)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                  num_workers=4, pin_memory=True, prefetch_factor=2)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                                num_workers=4, pin_memory=True, prefetch_factor=2)
 
-        # 创建数据集和数据加载器
-        train_dataset = AttributeDataset(X_train_tensor, y_train_tensor, P_train_tensor, attribute_indices)
-        val_dataset = AttributeDataset(X_val_tensor, y_val_tensor, P_val_tensor, attribute_indices)
+        model = PhysiCoFuse(num_classes).to(device)
 
-        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+        optimizer = optim.Adam([
+            {'params': model.mie.parameters(), 'lr': LR_OTHER},
+            {'params': model.ppmg.parameters(), 'lr': LR_OTHER},
+            {'params': model.resnet.parameters(), 'lr': LR_MAIN},
+            {'params': model.cmpc.parameters(), 'lr': LR_OTHER},
+            {'params': model.classifier.parameters(), 'lr': LR_MAIN}
+        ], weight_decay=WEIGHT_DECAY)
 
-        # 初始化模型
-        model = EnhancedMultiAttributeModel(
-            num_attributes=len(attribute_indices),
-            num_classes=num_classes,
-            dropout_rate=0.5
-        ).to(self.device)
-
-        # 优化器和损失函数
-        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         criterion = nn.CrossEntropyLoss()
 
         best_val_acc = 0.0
-        best_model_state = None
         patience_counter = 0
-        patience = 15
-        history = {'train_loss': [], 'val_acc': [], 'val_loss': []}  # 添加验证损失记录
 
-        print("开始训练...")
-        for epoch in range(epochs):
-            # 训练
-            model.train()
-            train_loss = 0.0
+        for epoch in range(EPOCHS):
+            train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion,
+                                                     CONSISTENCY_WEIGHT, epoch, scaler)
 
-            for batch_features, batch_labels, batch_attributes in train_loader:
-                batch_features = batch_features.to(self.device)
-                batch_labels = batch_labels.to(self.device)
-                batch_attributes = batch_attributes.to(self.device)
+            # 每隔 VALIDATION_INTERVAL 个 epoch 验证一次，且最后 epoch 必须验证
+            if (epoch + 1) % VALIDATION_INTERVAL == 0 or (epoch + 1) == EPOCHS:
+                val_loss, val_acc = validate(model, val_loader, criterion, CONSISTENCY_WEIGHT)
+                scheduler.step(val_loss)
+                print(f"Epoch {epoch+1}: Train Acc {train_acc:.2f}%, Val Acc {val_acc:.2f}% (Loss {val_loss:.4f})")
 
-                optimizer.zero_grad()
-                outputs = model(batch_features, batch_attributes)
-                loss = criterion(outputs, batch_labels)
-                loss.backward()
-
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-
-                train_loss += loss.item()
-
-            # 验证
-            model.eval()
-            val_correct = 0
-            val_total = 0
-            val_loss = 0.0
-
-            with torch.no_grad():
-                for batch_features, batch_labels, batch_attributes in val_loader:
-                    batch_features = batch_features.to(self.device)
-                    batch_labels = batch_labels.to(self.device)
-                    batch_attributes = batch_attributes.to(self.device)
-
-                    outputs = model(batch_features, batch_attributes)
-                    loss = criterion(outputs, batch_labels)
-                    val_loss += loss.item()
-
-                    _, predicted = outputs.max(1)
-                    val_total += batch_labels.size(0)
-                    val_correct += predicted.eq(batch_labels).sum().item()
-
-            val_acc = 100. * val_correct / val_total
-            val_loss_avg = val_loss / len(val_loader)
-            scheduler.step()
-
-            history['train_loss'].append(train_loss / len(train_loader))
-            history['val_acc'].append(val_acc)
-            history['val_loss'].append(val_loss_avg)
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                best_model_state = model.state_dict().copy()  # 保存最佳模型状态
-                patience_counter = 0
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    patience_counter = 0
+                    # ========== 保存半精度模型 ==========
+                    half_state_dict = {k: v.half() for k, v in model.state_dict().items()}
+                    torch.save(half_state_dict, os.path.join(OUTPUT_DIR, f'best_model_fold{fold+1}.pth'))
+                    print(f"  ✅ 保存最佳模型 (半精度, Val Acc {val_acc:.2f}%)")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= PATIENCE:
+                        print(f"⏹️ 早停于 epoch {epoch+1}")
+                        break
             else:
-                patience_counter += 1
+                print(f"Epoch {epoch+1}: Train Acc {train_acc:.2f}% (skip validation)")
 
-            if epoch % 10 == 0:
-                print(
-                    f"Epoch [{epoch + 1}/{epochs}], Train Loss: {train_loss / len(train_loader):.4f}, Val Acc: {val_acc:.2f}%, Val Loss: {val_loss_avg:.4f}")
+        fold_accs.append(best_val_acc)
+        print(f"Fold {fold+1} 最佳验证准确率: {best_val_acc:.2f}%")
 
-            if patience_counter >= patience:
-                print(f"早停于第 {epoch + 1} 轮")
-                break
+        # ===== 保存原始EIS热图（与第二段代码一致） =====
+        print(f"  保存原始EIS热图...")
+        num_save = min(4, len(val_idx))
+        for i in range(num_save):
+            idx = val_idx[i]
+            raw_eis = raw_eis_matrices[idx]  # shape (8,6)
+            conc = label_encoder.inverse_transform([labels[idx]])[0]  # 原始浓度（int）
+            # 归一化（MinMax）
+            scaler_vis = MinMaxScaler()
+            normalized = scaler_vis.fit_transform(raw_eis)
+            plt.figure(figsize=(8, 6))
+            plt.imshow(normalized, cmap='viridis', aspect='auto')
+            plt.colorbar(label='Normalized Value')
+            plt.title(f'Sample {idx}, Carrageenan: {conc}%')
+            plt.xlabel('Features')
+            plt.ylabel('Frequency (Hz)')
+            plt.xticks(range(len(FEATURES)), FEATURES)
+            plt.yticks(range(len(FREQUENCIES)), [str(f) for f in FREQUENCIES])
+            save_path = os.path.join(OUTPUT_DIR, f'eis_heatmap_fold{fold+1}_sample{i}_conc{conc}.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"  保存热图: {save_path}")
 
-        print(f"训练完成! 最佳验证准确率: {best_val_acc:.2f}%")
+    avg_acc = np.mean(fold_accs)
+    std_acc = np.std(fold_accs)
+    print("\n========== 最终结果 ==========")
+    print(f"各折准确率: {[f'{a:.2f}%' for a in fold_accs]}")
+    print(f"平均准确率: {avg_acc:.2f}% ± {std_acc:.2f}%")
 
-        return best_val_acc, history, best_model_state, feature_scaler, attribute_scaler
-
-
-# ==================================================
-# 6. 主流程（移除交叉验证，直接训练）
-# ==================================================
-def main_direct_training():
-    """主函数 - 直接训练模型"""
-    # 设备配置
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
-    print(f"{'=' * 80}")
-    print("四属性组合直接训练模型")
-    print(f"{'=' * 80}")
-
-    # 数据转换
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    # 步骤1: 生成伪图和生理属性
-    print("\n步骤1: 为每个样本生成伪图和生理属性...")
-    sample_id_map, spectral_data_map, phys_attr_map = generate_pseudo_images_per_sample()
-
-    if not sample_id_map:
-        print("错误: 没有成功生成任何伪图，请检查数据文件!")
-        return
-
-    # 步骤2: 提取特征
-    print("\n步骤2: 提取特征向量...")
-    feature_extractor = resnet50(weights=ResNet50_Weights.DEFAULT)
-    feature_extractor = nn.Sequential(*list(feature_extractor.children())[:-1])
-    feature_extractor.eval().to(device)
-
-    all_features = []
-    all_labels = []
-    all_phys_attributes = []
-
-    # 收集所有浓度
-    concentrations = []
-    sample_ids = []
-
-    for sample_id, info in sample_id_map.items():
-        concentrations.append(info['concentration'])
-        sample_ids.append(sample_id)
-
-    if not concentrations:
-        print("错误: 没有找到任何浓度信息!")
-        return
-
-    # 使用整数浓度作为标签
-    label_encoder = LabelEncoder()
-    labels_encoded = label_encoder.fit_transform(concentrations)
-    num_classes = len(label_encoder.classes_)
-
-    print(f"浓度类别: {sorted(label_encoder.classes_)}")
-    print(f"类别数量: {num_classes}")
-
-    # 提取特征
-    print("\n提取特征中...")
-    success_count = 0
-    for idx, (sample_id, sample_info) in enumerate(sample_id_map.items()):
-        # 提取伪图特征
-        pseudo_path = sample_info['image_path']
-        if not os.path.exists(pseudo_path):
-            print(f"警告: 伪图文件不存在: {pseudo_path}")
-            continue
-
-        try:
-            pseudo_img = Image.open(pseudo_path).convert('RGB')
-            pseudo_tensor = transform(pseudo_img).unsqueeze(0).to(device)
-            with torch.no_grad():
-                pseudo_features = feature_extractor(pseudo_tensor).squeeze().cpu().numpy()
-                if pseudo_features.ndim == 0:  # 如果是标量，转换为1D数组
-                    pseudo_features = np.array([pseudo_features])
-        except Exception as e:
-            print(f"处理伪图 {pseudo_path} 时出错: {e}")
-            continue
-
-        # 提取RGB图像特征（如果存在）
-        rgb_path = sample_info['rgb_image_path']
-        if rgb_path and os.path.exists(rgb_path):
-            try:
-                rgb_img = Image.open(rgb_path).convert('RGB')
-                rgb_tensor = transform(rgb_img).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    rgb_features = feature_extractor(rgb_tensor).squeeze().cpu().numpy()
-                    if rgb_features.ndim == 0:  # 如果是标量，转换为1D数组
-                        rgb_features = np.array([rgb_features])
-            except Exception as e:
-                print(f"处理RGB图像 {rgb_path} 时出错: {e}")
-                rgb_features = pseudo_features.copy()
-        else:
-            rgb_features = pseudo_features.copy()
-
-        # 拼接特征
-        try:
-            combined_features = np.concatenate((pseudo_features.flatten(), rgb_features.flatten()))
-        except Exception as e:
-            print(f"拼接特征时出错: {e}")
-            continue
-
-        # 获取生理属性
-        phys_attributes = sample_info['phys_attributes']
-
-        # 获取标签
-        label = labels_encoded[idx]
-
-        all_features.append(combined_features)
-        all_labels.append(label)
-        all_phys_attributes.append(phys_attributes)
-        success_count += 1
-
-        if success_count % 20 == 0:
-            print(f"已提取 {success_count} 个样本的特征...")
-
-    # 转换为numpy数组
-    if len(all_features) == 0:
-        print("错误: 没有提取到任何特征!")
-        return
-
-    all_features_np = np.array(all_features)
-    all_labels_np = np.array(all_labels)
-    all_phys_np = np.array(all_phys_attributes)
-
-    print(f"\n数据统计:")
-    print(f"总样本数: {len(all_features_np)}")
-    print(f"特征维度: {all_features_np.shape[1]}")
-    print(f"生理属性维度: {all_phys_np.shape[1]}")
-
-    # 检查数据平衡性
-    unique_labels, counts = np.unique(all_labels_np, return_counts=True)
-    print(f"\n类别分布:")
-    for label, count in zip(unique_labels, counts):
-        conc = label_encoder.inverse_transform([label])[0]
-        print(f"浓度 {conc}%: {count} 个样本")
-
-    # 检查是否有数据泄露风险
-    print(f"\n检查数据泄露风险...")
-
-    # 检查特征中是否有NaN或Inf
-    if np.isnan(all_features_np).any() or np.isinf(all_features_np).any():
-        print("警告: 特征数据包含NaN或Inf值!")
-        all_features_np = np.nan_to_num(all_features_np, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # 检查生理属性中是否有NaN或Inf
-    if np.isnan(all_phys_np).any() or np.isinf(all_phys_np).any():
-        print("警告: 生理属性数据包含NaN或Inf值!")
-        all_phys_np = np.nan_to_num(all_phys_np, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # 步骤3: 直接训练模型
-    print(f"\n{'=' * 80}")
-    print("开始直接训练目标属性组合模型...")
-    print(f"{'=' * 80}")
-
-    target_attrs = PhysiologicalAttributes.TARGET_ATTRIBUTES
-    target_names = [PhysiologicalAttributes.ATTRIBUTE_NAMES[i] for i in target_attrs]
-
-    print(f"目标四个属性: {', '.join(target_names)}")
-    print(f"目标属性索引: {target_attrs}")
-
-    # 创建结果目录
-    results_dir = 'Model-result/54/'
-    os.makedirs(results_dir, exist_ok=True)
-
-    # 初始化训练器
-    trainer = DirectTrainer(device=device)
-
-    # 直接训练
-    print(f"\n开始训练和验证...")
-    try:
-        final_val_acc, history, best_model_state, feature_scaler, attr_scaler = trainer.train_directly(
-            target_attrs, all_features_np, all_labels_np, all_phys_np,
-            num_classes, epochs=100, learning_rate=1e-4, test_size=0.2
-        )
-    except Exception as e:
-        print(f"训练过程中出错: {e}")
-        print("检查数据和参数...")
-        return
-
-    # 可视化训练过程
-    plt.figure(figsize=(15, 5))
-
-    # 绘制训练和验证损失
-    plt.subplot(1, 3, 1)
-    epochs_range = range(1, len(history['train_loss']) + 1)
-    plt.plot(epochs_range, history['train_loss'], 'r-', label='训练损失')
-    plt.plot(epochs_range, history['val_loss'], 'b-', label='验证损失')
-    plt.xlabel('轮次', fontsize=12)
-    plt.ylabel('损失', fontsize=12)
-    plt.title('训练与验证损失曲线', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-
-    # 绘制验证准确率曲线
-    plt.subplot(1, 3, 2)
-    plt.plot(epochs_range, history['val_acc'], 'g-', label='验证准确率')
-    plt.xlabel('轮次', fontsize=12)
-    plt.ylabel('准确率 (%)', fontsize=12)
-    plt.title('验证准确率曲线', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-
-    # 显示最终准确率
-    plt.subplot(1, 3, 3)
-    plt.text(0.5, 0.5, f'最终验证准确率\n{final_val_acc:.2f}%', horizontalalignment='center',
-             verticalalignment='center', transform=plt.gca().transAxes, fontsize=16, color='blue')
-    plt.xlim(0, 1)
-    plt.ylim(0, 1)
-    plt.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(results_dir, 'direct_training_results.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # 保存模型
-    print(f"\n保存模型...")
-    # 创建模型实例
-    model = EnhancedMultiAttributeModel(
-        input_dim=all_features_np.shape[1],
-        num_attributes=len(target_attrs),
-        num_classes=num_classes
-    )
-    model.load_state_dict(best_model_state)
-
-    # 构建模型文件名
-    model_filename = f'direct_model_target_attrs_{final_val_acc:.2f}.pth'
-    model_path = os.path.join(results_dir, model_filename)
-
-    # 保存模型及其相关信息
-    torch.save({
-        'model_state_dict': best_model_state,
-        'validation_accuracy': final_val_acc,
-        'input_dim': all_features_np.shape[1],
-        'num_attributes': len(target_attrs),
-        'num_classes': num_classes,
-        'attribute_indices': target_attrs,
-        'attribute_names': target_names,
-        'label_encoder_classes': label_encoder.classes_,
-        'feature_scaler': feature_scaler,  # 保存scalers以便后续推理
-        'attribute_scaler': attr_scaler,
-        'training_history': history
-    }, model_path)
-    print(f"已保存模型: {model_path}")
-
-    # 生成报告
-    print(f"\n{'=' * 80}")
-    print("四属性组合直接训练完成!")
-    print(f"{'=' * 80}")
-
-    print(f"\n最终结果:")
-    print(f"四个目标属性: {', '.join(target_names)}")
-    print(f"验证集准确率: {final_val_acc:.2f}%")
-
-    # 保存详细报告
-    report = f"""
-    四属性组合直接训练评估报告
-    =====================================================
-
-    评估日期: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
-    使用设备: {device}
-    总样本数: {len(all_features_np)}
-    训练集大小: {int(len(all_features_np) * 0.8)}
-    验证集大小: {int(len(all_features_np) * 0.2)}
-    类别数量: {num_classes}
-    特征维度: {all_features_np.shape[1]}
-
-    类别分布:
-    {'-' * 40}
-    """
-    for label, count in zip(unique_labels, counts):
-        conc = label_encoder.inverse_transform([label])[0]
-        report += f"    浓度 {conc}%: {count} 个样本 ({count / len(all_features_np) * 100:.1f}%)\n"
-
-    report += f"""
-    目标四个属性:
-    {'-' * 40}
-    """
-    for i, (idx, name) in enumerate(zip(target_attrs, target_names)):
-        report += f"    属性{i + 1}: {name} (索引: {idx})\n"
-
-    report += f"""
-    训练结果:
-    {'-' * 40}
-    验证集准确率: {final_val_acc:.2f}%
-
-    模型配置:
-    {'-' * 40}
-    网络结构: 简化版多属性融合模型
-    优化器: AdamW (学习率: 1e-4, 权重衰减: 1e-4)
-    调度器: CosineAnnealingLR
-    损失函数: CrossEntropyLoss
-    批次大小: 16
-    最大轮次: 100
-    早停耐心: 15
-    测试集比例: 0.2
-
-    数据泄露防范措施:
-    {'-' * 40}
-    1. 使用训练集统计信息进行特征标准化
-    2. 使用训练集统计信息进行属性归一化
-    3. 伪图生成使用样本自身统计信息，避免全局信息
-    4. 增加模型正则化（Dropout, 权重衰减）
-    5. 简化模型结构，减少过拟合风险
-
-    模型保存信息:
-    {'-' * 40}
-    已保存模型文件: {model_filename}
-    模型文件包含: 
-    - 状态字典 (model_state_dict)
-    - 验证准确率 (validation_accuracy)
-    - 输入维度 (input_dim)
-    - 属性数量 (num_attributes)
-    - 类别数量 (num_classes)
-    - 属性索引 (attribute_indices)
-    - 属性名称 (attribute_names)
-    - 标签编码器类别 (label_encoder_classes)
-    - 特征标准化器 (feature_scaler)
-    - 属性标准化器 (attribute_scaler)
-    - 训练历史 (training_history)
-
-    结论:
-    {'-' * 40}
-    四个目标属性(含水率、离子浓度、组织孔隙率、细胞完整性)组合的
-    直接训练模型在验证集上取得了 {final_val_acc:.2f}% 的准确率。
-    该模型已保存，可用于后续预测。
-    """
-
-    # 保存报告
-    with open(os.path.join(results_dir, 'direct_training_report.txt'), 'w', encoding='utf-8') as f:
-        f.write(report)
-
-    print(f"\n报告已保存到: {results_dir}/")
-    print(f"  1. 评估报告: direct_training_report.txt")
-    print(f"  2. 可视化图: direct_training_results.png")
-    print(f"  3. 模型文件: {model_filename}")
-
+    with open(os.path.join(OUTPUT_DIR, 'cv_results.txt'), 'w') as f:
+        f.write(f"5-Fold CV Accuracy: {avg_acc:.2f}% ± {std_acc:.2f}%\n")
+        f.write(f"Per fold: {fold_accs}\n")
 
 if __name__ == '__main__':
-    main_direct_training()
+    main()
