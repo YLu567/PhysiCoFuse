@@ -1,16 +1,13 @@
 # 🥩 PhysiCoFuse: 物理引导的阻抗与视觉融合框架
 **Biophysically-Guided Spatially Consistent Alignment of Electrical Impedance Spectroscopy and RGB Imagery**
 
-本仓库提供了 PhysiCoFuse 框架的官方实现。这是一个基于深度学习的多模态融合框架，旨在通过结合**电阻抗谱 (EIS)** 和 **RGB 图像**，实现对肉制品中亲水胶体（如卡拉胶）掺假的无损、高精度定量检测。
-
-该框架通过引入生物物理约束，解决了传统多模态融合中缺乏物理一致性和空间对齐的痛点，实现了 SOTA (State-of-the-Art) 的检测精度。
-
+本仓库包含 PhysiCoFuse 模型的完整训练代码，用于基于 EIS（电阻抗谱）和 RGB 图像的多模态融合检测肉类中亲水胶体掺假。
 ---
 
  **PhysiCoFuse** 框架包含三个核心模块：
-1.  **多频率阻抗编码器 (MIE)**：提取关键频段特征。
-2.  **伪生理图生成器 (PPMG)**：将 EIS 光谱编码为具有物理语义（如含水量、离子浓度）的空间图。
-3.  **跨模态物理一致性模块 (CMPC)**：强制约束介电特征与光学特征之间的物理一致性。
+1.  **多频率阻抗编码器 (MIE)**：从原始EIS数据中提取判别性特征，并自适应地强调关键频率信息。。
+2.  **伪生理图生成器 (PPMG)**：将抽象的一维EIS信号转化为空间结构化的“伪图像”，作为连接电学信号与视觉特征的桥梁。
+3.  **跨模态物理一致性模块 (CMPC)**：在共享物理空间中强制对齐视觉特征与电学特征，确保多模态融合基于共同的物理本质，而非单纯的统计相关性。
 
 ---
 
@@ -18,15 +15,15 @@
 ## 🏗️ 框架架构 (Framework Architecture)
 
 PhysiCoFuse 的核心逻辑包含以下步骤：
-
-1.  **数据获取**：同步采集牛肉样本的 RGB 图像和 EIS 数据（8个频率点 × 6个电气参数）。
-2.  **多频率阻抗编码 (MIE)**：利用频率注意力机制，自适应加权对掺假检测最有用的频率信息。
-3.  **伪生理图生成 (PPMG)**：
-    *   将一维阻抗特征解码为水含量、离子浓度等生理属性。
-    *   将这些属性扩展为空间热力图（Pseudo-Physiological Map），与 RGB 特征图对齐。
-4.  **跨模态物理一致性 (CMPC)**：
-    *   强制 RGB 分支预测的物理属性与 EIS 分支预测的属性保持一致（通过 MSE Loss 约束）。
-5.  **特征融合与分类**：融合后的特征输入 MLP 进行最终分类。
+使用 EIS (8×6) 和 RGB 图像 作为双模态输入
+包含 PPMG（伪生理图生成器），生成 4 通道伪生理属性图
+7 通道 ResNet50（RGB + 4 伪图）提取图像特征
+MIE（多频阻抗编码器） + CMPC（跨模态物理一致性模块）
+5 折 Stratified 交叉验证
+数据增强（仅训练集）
+混合精度训练（自动混合精度，仅在 GPU 可用时启用）
+半精度模型保存（float16），显著减小模型文件大小
+自动保存原始 EIS 伪图（每折保存 4 张）
 
 ---
 
@@ -36,11 +33,12 @@ PhysiCoFuse 的核心逻辑包含以下步骤：
 
 ### 1. 依赖库 (Dependencies)
 ```bash
-python==3.11
-torch==2.0.1
-torchvision==0.15.2
-numpy
-pandas
-scikit-learn
-opencv-python
-matplotlib
+torch>=1.10.0
+torchvision>=0.11.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+Pillow>=9.0.0
+openpyxl>=3.0.0   # 读取 .xlsx
+matplotlib>=3.5.0
+tqdm>=4.64.0
