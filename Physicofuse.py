@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-PhysiCoFuse 完整代码（加速 + 半精度模型保存）
+PhysiCoFuse 完整代码（加速 + 半精度模型保存 + 模型缩小版）
 - 使用 EIS (8×6) + RGB 图像
 - 可学习 PPMG (生成 4 通道伪生理属性图)
-- 7 通道输入 ResNet50 (RGB + 4 伪图)
+- 7 通道输入 ResNet (RGB + 4 伪图)
 - MIE + CMPC + 分类器
 - 5 折 Stratified Cross-Validation
 - 数据增强 (仅训练集)
@@ -12,6 +12,7 @@ PhysiCoFuse 完整代码（加速 + 半精度模型保存）
 - 混合精度训练 (若 GPU 可用)
 - 加速设置：较大 batch size、cudnn.benchmark、减少验证频率、prefetch
 - 模型保存为半精度 (float16)，显著减小 pth 文件大小
+- 每折训练结束后保存原始 EIS 热图
 """
 
 import os
@@ -21,7 +22,7 @@ import warnings
 import numpy as np
 import pandas as pd
 from PIL import Image
-from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler  # 添加 MinMaxScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
 from sklearn.model_selection import StratifiedKFold
 
 import torch
@@ -30,7 +31,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet18, ResNet18_Weights
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
@@ -39,25 +40,23 @@ warnings.filterwarnings('ignore')
 # ====================== 全局配置 ======================
 SEED = 42
 N_SPLITS = 5
-BATCH_SIZE = 32               # 增大 batch size（显存不足可调为 24 或 16）
+BATCH_SIZE = 32
 EPOCHS = 50
-LR_MAIN = 1e-3                # 分类器 / ResNet 学习率（微调）
-LR_OTHER = 2e-4               # MIE, PPMG, CMPC 学习率
+LR_MAIN = 2e-5
+LR_OTHER = 2e-4
 WEIGHT_DECAY = 1e-4
-PATIENCE = 10                  # 早停耐心
+PATIENCE = 5
 CONSISTENCY_WEIGHT = 0.01
-VALIDATION_INTERVAL = 2       # 每 2 个 epoch 验证一次，减少验证开销
+VALIDATION_INTERVAL = 2
 
-# 数据目录（修改为您的实际路径）
-DATA_ROOT = './data'
+DATA_ROOT = 'D:/电谱/Manuscript and cover letter/JFCA/Physicofuse/data/data-1080'
 SPECTRA_DIR = os.path.join(DATA_ROOT, 'spectra')
 LABELS_DIR = os.path.join(DATA_ROOT, 'labels')
 IMAGES_DIR = os.path.join(DATA_ROOT, 'images')
 
-OUTPUT_DIR = './results'
+OUTPUT_DIR = './physicofuse-cyl-0720'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 固定频率和特征名（与 Excel 列名一致）
 FREQUENCIES = [100, 500, 1000, 3000, 8000, 15000, 50000, 200000]
 FEATURES = ['CP', 'CS', 'Z', 'Φ', 'R', 'X']
 
@@ -69,7 +68,6 @@ def set_seed(seed=SEED):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 关闭确定性以启用 cuDNN 自动优化（提升速度）
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 set_seed()
@@ -87,7 +85,6 @@ def load_data_from_directories(spectra_dir, labels_dir, images_dir):
     concentrations = []
 
     for sid in tqdm(sample_ids, desc="加载样本"):
-        # 标签
         label_file = os.path.join(labels_dir, sid + '.txt')
         if not os.path.exists(label_file):
             continue
@@ -100,7 +97,6 @@ def load_data_from_directories(spectra_dir, labels_dir, images_dir):
         except:
             continue
 
-        # EIS
         spec_file = os.path.join(spectra_dir, sid + '.xlsx')
         try:
             df = pd.read_excel(spec_file)
@@ -120,7 +116,6 @@ def load_data_from_directories(spectra_dir, labels_dir, images_dir):
         except:
             continue
 
-        # 图像
         img_path = None
         for ext in ['.jpg', '.jpeg', '.png']:
             candidate = os.path.join(images_dir, sid + ext)
@@ -163,16 +158,16 @@ class PhysiCoFuseDataset(Dataset):
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         return rgb, eis, label
 
-# ====================== 模型组件（论文架构，完全不变） ======================
+# ====================== 模型组件（论文架构，缩小版） ======================
 class MultiFrequencyImpedanceEncoder(nn.Module):
-    def __init__(self, num_freq=8, num_params=6, feat_dim=128):
+    def __init__(self, num_freq=8, num_params=6, feat_dim=64):
         super().__init__()
-        self.conv1 = nn.Conv1d(num_params, 64, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm1d(256)
+        self.conv1 = nn.Conv1d(num_params, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(128)
         self.final_freq_dim = num_freq // 4
         self.freq_attention = nn.Sequential(
             nn.Linear(self.final_freq_dim, self.final_freq_dim),
@@ -181,10 +176,10 @@ class MultiFrequencyImpedanceEncoder(nn.Module):
             nn.Softmax(dim=1)
         )
         self.fc = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(128, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Linear(256, feat_dim)
+            nn.Linear(128, feat_dim)
         )
         self.feat_dim = feat_dim
 
@@ -218,10 +213,10 @@ class PseudoBiophysicalMapGenerator(nn.Module):
         attr_maps = attr_maps.expand(-1, -1, self.map_size, self.map_size)
         return attr_maps, attr_scores
 
-class ResNet50_7ch(nn.Module):
+class ResNet18_7ch(nn.Module):
     def __init__(self, freeze_layers=True):
         super().__init__()
-        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        resnet = resnet18(weights=ResNet18_Weights.DEFAULT)
         old_conv = resnet.conv1
         new_conv = nn.Conv2d(7, old_conv.out_channels,
                              kernel_size=old_conv.kernel_size,
@@ -233,11 +228,11 @@ class ResNet50_7ch(nn.Module):
             new_conv.weight[:, 3:] = old_conv.weight.mean(dim=1, keepdim=True).repeat(1, 4, 1, 1)
         resnet.conv1 = new_conv
         self.features = nn.Sequential(*list(resnet.children())[:-1])
-        self.out_dim = 2048
+        self.out_dim = 512
 
         if freeze_layers:
             for i, child in enumerate(self.features.children()):
-                if i < 5:   # 前5个模块 (conv1 ~ layer3)
+                if i < 5:
                     for param in child.parameters():
                         param.requires_grad = False
 
@@ -246,27 +241,27 @@ class ResNet50_7ch(nn.Module):
         return x.squeeze(-1).squeeze(-1)
 
 class CrossModalPhysicalConsistency(nn.Module):
-    def __init__(self, img_feat_dim=2048, imp_feat_dim=128, num_attrs=4, fused_dim=512):
+    def __init__(self, img_feat_dim=512, imp_feat_dim=64, num_attrs=4, fused_dim=256):
         super().__init__()
         self.num_attrs = num_attrs
         self.img_to_phys = nn.Sequential(
-            nn.Linear(img_feat_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Linear(512, num_attrs)
-        )
-        self.imp_to_phys = nn.Sequential(
-            nn.Linear(imp_feat_dim, 256),
+            nn.Linear(img_feat_dim, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Linear(256, num_attrs)
         )
+        self.imp_to_phys = nn.Sequential(
+            nn.Linear(imp_feat_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Linear(128, num_attrs)
+        )
         self.fusion = nn.Sequential(
-            nn.Linear(img_feat_dim + imp_feat_dim, 1024),
-            nn.BatchNorm1d(1024),
+            nn.Linear(img_feat_dim + imp_feat_dim, 384),
+            nn.BatchNorm1d(384),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(1024, fused_dim),
+            nn.Linear(384, fused_dim),
             nn.BatchNorm1d(fused_dim),
             nn.ReLU()
         )
@@ -284,15 +279,15 @@ class FeatureClassifier(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
         self.classifier = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
+            nn.Linear(input_dim, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
+            nn.Linear(128, num_classes)
         )
 
     def forward(self, x):
@@ -303,7 +298,7 @@ class PhysiCoFuse(nn.Module):
         super().__init__()
         self.mie = MultiFrequencyImpedanceEncoder()
         self.ppmg = PseudoBiophysicalMapGenerator(imp_feat_dim=self.mie.feat_dim)
-        self.resnet = ResNet50_7ch(freeze_layers=True)
+        self.resnet = ResNet18_7ch(freeze_layers=True)
         self.cmpc = CrossModalPhysicalConsistency(
             img_feat_dim=self.resnet.out_dim,
             imp_feat_dim=self.mie.feat_dim
@@ -390,8 +385,7 @@ def main():
     )
     num_classes = len(label_encoder.classes_)
 
-    # 保存原始EIS矩阵（用于生成热图，与第二段代码一致）
-    raw_eis_matrices = eis_matrices  # 原始未标准化矩阵
+    raw_eis_matrices = eis_matrices
 
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
@@ -425,7 +419,6 @@ def main():
         train_labels = [labels[i] for i in train_idx]
         val_labels = [labels[i] for i in val_idx]
 
-        # 标准化 EIS
         train_eis_flat = np.array([mat.flatten() for mat in train_eis])
         val_eis_flat = np.array([mat.flatten() for mat in val_eis])
         scaler_eis = StandardScaler()
@@ -461,7 +454,6 @@ def main():
             train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion,
                                                      CONSISTENCY_WEIGHT, epoch, scaler)
 
-            # 每隔 VALIDATION_INTERVAL 个 epoch 验证一次，且最后 epoch 必须验证
             if (epoch + 1) % VALIDATION_INTERVAL == 0 or (epoch + 1) == EPOCHS:
                 val_loss, val_acc = validate(model, val_loader, criterion, CONSISTENCY_WEIGHT)
                 scheduler.step(val_loss)
@@ -470,7 +462,6 @@ def main():
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     patience_counter = 0
-                    # ========== 保存半精度模型 ==========
                     half_state_dict = {k: v.half() for k, v in model.state_dict().items()}
                     torch.save(half_state_dict, os.path.join(OUTPUT_DIR, f'best_model_fold{fold+1}.pth'))
                     print(f"  ✅ 保存最佳模型 (半精度, Val Acc {val_acc:.2f}%)")
@@ -485,14 +476,12 @@ def main():
         fold_accs.append(best_val_acc)
         print(f"Fold {fold+1} 最佳验证准确率: {best_val_acc:.2f}%")
 
-        # ===== 保存原始EIS热图（与第二段代码一致） =====
         print(f"  保存原始EIS热图...")
         num_save = min(4, len(val_idx))
         for i in range(num_save):
             idx = val_idx[i]
-            raw_eis = raw_eis_matrices[idx]  # shape (8,6)
-            conc = label_encoder.inverse_transform([labels[idx]])[0]  # 原始浓度（int）
-            # 归一化（MinMax）
+            raw_eis = raw_eis_matrices[idx]
+            conc = label_encoder.inverse_transform([labels[idx]])[0]
             scaler_vis = MinMaxScaler()
             normalized = scaler_vis.fit_transform(raw_eis)
             plt.figure(figsize=(8, 6))
